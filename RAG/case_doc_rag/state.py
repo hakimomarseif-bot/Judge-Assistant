@@ -71,3 +71,8 @@ class SubQuestionState(TypedDict):
     sub_answer: str
     sources: List[str]
     found: bool
+
+    # -- Fan-out result field (must match AgentState.sub_answers so that
+    #    branch results propagate back to the parent graph via the
+    #    operator.add reducer) --
+    sub_answers: Annotated[List[Dict[str, Any]], operator.add]
