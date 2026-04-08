@@ -15,14 +15,13 @@ from RAG.case_doc_rag.nodes.generation_nodes import (
     refineQuestion,
 )
 from RAG.case_doc_rag.nodes.query_nodes import (
-    dispatchQuestions,
     offTopicResponse,
     questionClassifier,
     questionRewriter,
 )
 from RAG.case_doc_rag.nodes.retrieval_nodes import retrieve, retrievalGrader
 from RAG.case_doc_rag.nodes.selection_nodes import DocumentFinalizer, documentSelector
-from RAG.case_doc_rag.routers import docSelectorRouter, onTopicRouter, proceedRouter
+from RAG.case_doc_rag.routers import docSelectorDispatchRouter, onTopicRouter, proceedRouter
 from RAG.case_doc_rag.state import AgentState, SubQuestionState
 
 
@@ -64,7 +63,6 @@ def build_graph():
     workflow.add_node("offTopicResponse", offTopicResponse)
     workflow.add_node("documentSelector", documentSelector)
     workflow.add_node("DocumentFinalizer", DocumentFinalizer)
-    workflow.add_node("dispatchQuestions", dispatchQuestions)
     workflow.add_node("retrieve_branch", branch_graph)
     workflow.add_node("mergeAnswers", mergeAnswers)
     workflow.add_node("errorResponse", errorResponse)
@@ -84,17 +82,13 @@ def build_graph():
     workflow.add_edge("offTopicResponse", END)
     workflow.add_conditional_edges(
         "documentSelector",
-        docSelectorRouter,
+        docSelectorDispatchRouter,
         {
             "DocumentFinalizer": "DocumentFinalizer",
-            "dispatchQuestions": "dispatchQuestions",
             "errorResponse": "errorResponse",
         },
     )
     workflow.add_edge("DocumentFinalizer", END)
-    # dispatchQuestions returns Send objects at runtime; static edge required
-    # for graph validation
-    workflow.add_edge("dispatchQuestions", "retrieve_branch")
     workflow.add_edge("retrieve_branch", "mergeAnswers")
     workflow.add_edge("mergeAnswers", END)
     workflow.add_edge("errorResponse", END)
