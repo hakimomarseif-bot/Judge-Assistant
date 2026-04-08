@@ -165,7 +165,13 @@ class TestStateTypedict:
         from RAG.case_doc_rag.state import AgentState
         ann = AgentState.__annotations__
         mode_type = ann["doc_selection_mode"]
-        args = typing.get_args(mode_type)
+        # Unwrap Annotated (reducer wrapper) if present to reach the Literal
+        outer_args = typing.get_args(mode_type)
+        if typing.get_origin(mode_type) is typing.Annotated:
+            literal_type = outer_args[0]
+            args = typing.get_args(literal_type)
+        else:
+            args = outer_args
         assert "retrieve_specific_doc" in args
         assert "restrict_to_doc" in args
         assert "no_doc_specified" in args
@@ -1613,3 +1619,484 @@ class TestIntegrationSmoke:
         assert infra._vectorstore is fake
         # Restore
         infra._vectorstore = original
+
+
+# ===========================================================================
+# STANDALONE RAGAS EVALUATION
+# ===========================================================================
+# Run directly:  python test_case_doc_rag.py
+#
+# This block:
+#   1. Seeds MongoDB and Qdrant with the 7 fixture documents
+#   2. Runs 10 test cases against the live Case Doc RAG pipeline
+#   3. Evaluates results using RAGAS metrics
+#   4. Tears down seeded data
+# ===========================================================================
+
+if __name__ == "__main__":
+    import os
+    import sys
+    import traceback
+    from pathlib import Path
+
+    # ------------------------------------------------------------------
+    # Constants
+    # ------------------------------------------------------------------
+    CASE_ID = "2847_2024_civil_south_cairo"
+    FIXTURES_DIR = Path(__file__).parent / "fixtures"
+    CHUNK_SIZE = 1500
+    CHUNK_OVERLAP = 200
+
+    # Filename -> document title mapping (matches _DOC_MAP in test_real_data.py)
+    _DOC_MAP = {
+        "صحيفة_دعوى.txt":                       "صحيفة دعوى",
+        "محضر_جلسة_25_03_2024.txt":              "محضر جلسة",
+        "تقرير_الخبير.txt":                      "تقرير خبير",
+        "تقرير_الطب_الشرعي.txt":                "تقرير الطب الشرعي",
+        "حكم_المحكمة.txt":                       "حكم",
+        "مذكرة_بدفاع_المدعى_عليه_الأول.txt":    "مذكرة بدفاع",
+        "مذكرة_بدفاع_المدعى_عليها_الثانية.txt": "مذكرة بدفاع",
+    }
+
+    # 10 evaluation test cases
+    TEST_CASES = [
+        {
+            "query": "ما هي وقائع الدعوى؟",
+            "expected_keywords": ["دعوى", "وقائع", "عقد", "بيع"],
+            "ground_truth": "الدعوى تتعلق بفسخ عقد بيع ابتدائي مزور لشقة سكنية",
+        },
+        {
+            "query": "من هم أطراف الدعوى؟",
+            "expected_keywords": ["المدعي", "المدعى عليه"],
+            "ground_truth": "المدعي أحمد محمد عبد الله والمدعى عليه الأول محمود سعيد إبراهيم والمدعى عليها الثانية شركة العقارات الحديثة",
+        },
+        {
+            "query": "ما هي طلبات المدعي؟",
+            "expected_keywords": ["فسخ", "تعويض"],
+            "ground_truth": "فسخ عقد البيع المزور وإلزام المدعى عليهما بمبلغ مليوني جنيه تعويضاً",
+        },
+        {
+            "query": "ما هو رأي الخبير الهندسي؟",
+            "expected_keywords": ["خبير", "تقرير"],
+            "ground_truth": "تقرير الخبير يتضمن تقييم الأضرار والعقار",
+        },
+        {
+            "query": "ماذا قرر الطب الشرعي بشأن التوقيع؟",
+            "expected_keywords": ["توقيع", "تزوير", "طب شرعي"],
+            "ground_truth": "تقرير الطب الشرعي يؤكد تزوير التوقيع المنسوب للمدعي",
+        },
+        {
+            "query": "ما هو منطوق الحكم؟",
+            "expected_keywords": ["حكم", "محكمة"],
+            "ground_truth": "حكم المحكمة في الدعوى",
+        },
+        {
+            "query": "ما هي أوجه دفاع المدعى عليهما؟ وما الأسانيد القانونية؟",
+            "expected_keywords": ["دفاع", "مذكرة"],
+            "ground_truth": "دفاع المدعى عليهما يتضمن أسانيد قانونية ومستندات",
+        },
+        {
+            "query": "ما هي المستندات المقدمة من المدعي؟",
+            "expected_keywords": ["مستندات", "عقد"],
+            "ground_truth": "المستندات تشمل بطاقة الهوية وعقد الملكية وعقد البيع المطعون فيه وتقرير الطب الشرعي ومحضر الجلسة",
+        },
+        {
+            "query": "ما هي إجراءات الجلسة الأخيرة؟",
+            "expected_keywords": ["جلسة", "محكمة"],
+            "ground_truth": "تم ندب خبير هندسي وتحديد جلسة لإيداع التقرير",
+        },
+        {
+            "query": "ما هو رقم القضية ومحكمة الاختصاص؟ وما هو تاريخ رفع الدعوى؟",
+            "expected_keywords": ["2847", "2024", "محكمة"],
+            "ground_truth": "الدعوى رقم 2847 لسنة 2024 أمام محكمة جنوب القاهرة الابتدائية",
+        },
+    ]
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _read_fixture(filename: str) -> str:
+        """Read a fixture file from disk."""
+        return (FIXTURES_DIR / filename).read_text(encoding="utf-8")
+
+    def _chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
+        """Split text into overlapping chunks."""
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = start + chunk_size
+            chunks.append(text[start:end])
+            start = end - overlap
+            if start >= len(text):
+                break
+        return chunks
+
+    # ------------------------------------------------------------------
+    # Seeding: MongoDB + Qdrant
+    # ------------------------------------------------------------------
+
+    def seed_mongodb(case_id: str):
+        """Insert fixture documents into MongoDB Document Storage collection."""
+        from pymongo import MongoClient
+        from config import cfg
+
+        uri = cfg.mongodb.get("uri", "mongodb://localhost:27017/")
+        db_name = cfg.mongodb.get("database", "Rag")
+        coll_name = cfg.mongodb.get("collection", "Document Storage")
+
+        client = MongoClient(uri)
+        collection = client[db_name][coll_name]
+
+        docs_inserted = 0
+        for filename, title in _DOC_MAP.items():
+            content = _read_fixture(filename)
+            chunks = _chunk_text(content)
+            for idx, chunk in enumerate(chunks):
+                record = {
+                    "case_id": case_id,
+                    "title": title,
+                    "content": chunk,
+                    "source_file": filename,
+                    "chunk_index": idx,
+                }
+                collection.insert_one(record)
+                docs_inserted += 1
+
+        # Verify
+        count = collection.count_documents({"case_id": case_id})
+        print(f"[SEED] Inserted {docs_inserted} chunks into MongoDB (verified {count} for case_id={case_id})")
+
+        # Also check distinct titles
+        titles = collection.distinct("title", {"case_id": case_id})
+        print(f"[SEED] Fetched {len(titles)} doc titles for case_id={case_id} from MongoDB")
+        return client  # Return client for teardown
+
+    def seed_qdrant(case_id: str):
+        """Embed and insert fixture documents into Qdrant judicial_docs collection."""
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Distance, PointStruct, VectorParams
+        from config import cfg
+
+        host = cfg.qdrant.get("host", "localhost")
+        port = cfg.qdrant.get("port", 6333)
+        collection_name = cfg.qdrant.get("collection", "judicial_docs")
+        vector_size = cfg.qdrant.get("vector_size", 1024)
+
+        qdrant = QdrantClient(host=host, port=port)
+
+        # Create collection if it doesn't exist
+        existing = [c.name for c in qdrant.get_collections().collections]
+        if collection_name not in existing:
+            qdrant.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+            )
+            print(f"[SEED] Created Qdrant collection '{collection_name}' (size={vector_size})")
+        else:
+            print(f"[SEED] Qdrant collection '{collection_name}' already exists")
+
+        # Load embedding model (same as production: BAAI/bge-m3)
+        from langchain_huggingface import HuggingFaceEmbeddings
+        model_name = cfg.embedding.get("model", "BAAI/bge-m3")
+        print(f"[SEED] Loading embedding model: {model_name}")
+        embed_fn = HuggingFaceEmbeddings(model_name=model_name)
+
+        points = []
+        point_id = 0
+        for filename, title in _DOC_MAP.items():
+            content = _read_fixture(filename)
+            chunks = _chunk_text(content)
+            for idx, chunk in enumerate(chunks):
+                vector = embed_fn.embed_query(chunk)
+                points.append(
+                    PointStruct(
+                        id=point_id,
+                        vector=vector,
+                        payload={
+                            "page_content": chunk,
+                            "metadata": {
+                                "case_id": case_id,
+                                "title": title,
+                                "source_file": filename,
+                                "chunk_index": idx,
+                            },
+                        },
+                    )
+                )
+                point_id += 1
+
+        # Upsert in batches
+        batch_size = 50
+        for i in range(0, len(points), batch_size):
+            batch = points[i : i + batch_size]
+            qdrant.upsert(collection_name=collection_name, points=batch)
+
+        print(f"[SEED] Inserted {len(points)} vectors into Qdrant collection '{collection_name}'")
+        return qdrant  # Return client for teardown
+
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
+
+    def teardown_mongodb(case_id: str):
+        """Remove seeded documents from MongoDB."""
+        from pymongo import MongoClient
+        from config import cfg
+
+        uri = cfg.mongodb.get("uri", "mongodb://localhost:27017/")
+        db_name = cfg.mongodb.get("database", "Rag")
+        coll_name = cfg.mongodb.get("collection", "Document Storage")
+
+        client = MongoClient(uri)
+        collection = client[db_name][coll_name]
+        result = collection.delete_many({"case_id": case_id})
+        print(f"[TEARDOWN] Deleted {result.deleted_count} MongoDB records for case_id={case_id}")
+
+    def teardown_qdrant(case_id: str):
+        """Remove seeded vectors from Qdrant by case_id filter."""
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        from config import cfg
+
+        host = cfg.qdrant.get("host", "localhost")
+        port = cfg.qdrant.get("port", 6333)
+        collection_name = cfg.qdrant.get("collection", "judicial_docs")
+
+        qdrant = QdrantClient(host=host, port=port)
+        qdrant.delete(
+            collection_name=collection_name,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="metadata.case_id",
+                        match=MatchValue(value=case_id),
+                    )
+                ]
+            ),
+        )
+        print(f"[TEARDOWN] Deleted Qdrant vectors for case_id={case_id}")
+
+    # ------------------------------------------------------------------
+    # Run pipeline on test cases
+    # ------------------------------------------------------------------
+
+    def run_evaluation():
+        """Execute all test cases and collect results for RAGAS evaluation."""
+        from RAG.case_doc_rag import run
+
+        results = []
+        for i, tc in enumerate(TEST_CASES, 1):
+            query = tc["query"]
+            print(f"\n{'='*60}")
+            print(f"Test Case {i}: {query}")
+            print(f"{'='*60}")
+
+            try:
+                output = run(
+                    query=query,
+                    case_id=CASE_ID,
+                    conversation_history=[],
+                    request_id=f"ragas-eval-{i:03d}",
+                )
+
+                answer = output.get("final_answer", "")
+                sub_answers = output.get("sub_answers", [])
+                error = output.get("error")
+
+                # Gather contexts from sub_answers
+                contexts = []
+                for sa in sub_answers:
+                    sources = sa.get("sources", [])
+                    contexts.extend(sources)
+                if not contexts:
+                    contexts = ["No context retrieved"]
+
+                print(f"  Answer: {answer[:200]}...")
+                if error:
+                    print(f"  Error: {error}")
+
+                # Check expected keywords
+                found_kw = [kw for kw in tc["expected_keywords"] if kw in answer]
+                print(f"  Keywords found: {found_kw}/{tc['expected_keywords']}")
+
+                results.append({
+                    "query": query,
+                    "answer": answer,
+                    "contexts": contexts,
+                    "ground_truth": tc["ground_truth"],
+                    "error": error,
+                })
+
+            except Exception as e:
+                print(f"  FAILED: {e}")
+                traceback.print_exc()
+                results.append({
+                    "query": query,
+                    "answer": f"ERROR: {e}",
+                    "contexts": ["Error during execution"],
+                    "ground_truth": tc["ground_truth"],
+                    "error": str(e),
+                })
+
+        return results
+
+    # ------------------------------------------------------------------
+    # RAGAS evaluation
+    # ------------------------------------------------------------------
+
+    def run_ragas_evaluation(results):
+        """Run RAGAS metrics on the collected results.
+
+        Uses gemini-2.5-flash (matching config/settings.yaml) and the
+        modern ragas API.
+        """
+        try:
+            from datasets import Dataset
+            from ragas import evaluate
+
+            # Try modern API first, fall back to legacy wrappers
+            try:
+                from ragas.llms import LangchainLLMWrapper
+                from ragas.embeddings import LangchainEmbeddingsWrapper
+            except ImportError:
+                LangchainLLMWrapper = None
+                LangchainEmbeddingsWrapper = None
+
+            # Try modern metric imports first, fall back to legacy
+            try:
+                from ragas.metrics import (
+                    answer_relevancy,
+                    context_precision,
+                    context_recall,
+                    faithfulness,
+                )
+            except ImportError:
+                from ragas.metrics import (
+                    AnswerRelevancy as answer_relevancy,
+                    ContextPrecision as context_precision,
+                    ContextRecall as context_recall,
+                    Faithfulness as faithfulness,
+                )
+
+            from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+
+            print("\n" + "=" * 60)
+            print("RAGAS EVALUATION")
+            print("=" * 60)
+
+            # Build the evaluation dataset
+            eval_data = {
+                "question": [r["query"] for r in results],
+                "answer": [r["answer"] for r in results],
+                "contexts": [r["contexts"] for r in results],
+                "ground_truth": [r["ground_truth"] for r in results],
+            }
+            dataset = Dataset.from_dict(eval_data)
+
+            # Initialize LLM and embeddings for RAGAS -- use gemini-2.5-flash
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash",
+                temperature=0.0,
+            )
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/text-embedding-004",
+            )
+
+            # Wrap for RAGAS if wrappers are available
+            eval_kwargs = {
+                "dataset": dataset,
+                "metrics": [answer_relevancy, context_precision, context_recall, faithfulness],
+            }
+            if LangchainLLMWrapper is not None:
+                eval_kwargs["llm"] = LangchainLLMWrapper(llm)
+            else:
+                eval_kwargs["llm"] = llm
+            if LangchainEmbeddingsWrapper is not None:
+                eval_kwargs["embeddings"] = LangchainEmbeddingsWrapper(embeddings)
+            else:
+                eval_kwargs["embeddings"] = embeddings
+
+            # Run evaluation
+            ragas_result = evaluate(**eval_kwargs)
+
+            print("\nRagas Scores:")
+            print("-" * 40)
+            for metric_name, score in ragas_result.items():
+                if isinstance(score, (int, float)):
+                    print(f"  {metric_name}: {score:.4f}")
+            print("-" * 40)
+
+            return ragas_result
+
+        except ImportError as e:
+            print(f"\n[RAGAS] Skipping RAGAS evaluation -- missing dependency: {e}")
+            print("[RAGAS] Install with: pip install ragas datasets langchain-google-genai")
+            return None
+        except Exception as e:
+            print(f"\n[RAGAS] RAGAS evaluation failed: {e}")
+            traceback.print_exc()
+            return None
+
+    # ------------------------------------------------------------------
+    # Main execution flow
+    # ------------------------------------------------------------------
+
+    print("=" * 60)
+    print("CASE RAG STANDALONE RAGAS EVALUATION")
+    print("=" * 60)
+
+    # Check required env vars
+    missing_vars = []
+    for var in ["MONGO_URI", "QDRANT_HOST", "GOOGLE_API_KEY"]:
+        if not os.getenv(var):
+            missing_vars.append(var)
+    if missing_vars:
+        # MONGO_URI and QDRANT_HOST may use defaults; only GOOGLE_API_KEY is hard-required
+        if "GOOGLE_API_KEY" in missing_vars:
+            print(f"ERROR: Missing required env var GOOGLE_API_KEY")
+            sys.exit(1)
+        else:
+            print(f"WARNING: Missing env vars {missing_vars} -- using defaults from settings.yaml")
+
+    try:
+        # Step 1: Seed data
+        print("\n--- STEP 1: Seeding MongoDB ---")
+        seed_mongodb(CASE_ID)
+
+        print("\n--- STEP 2: Seeding Qdrant ---")
+        seed_qdrant(CASE_ID)
+
+        # Step 3: Run test cases
+        print("\n--- STEP 3: Running test cases ---")
+        results = run_evaluation()
+
+        # Step 4: RAGAS evaluation
+        print("\n--- STEP 4: RAGAS evaluation ---")
+        ragas_result = run_ragas_evaluation(results)
+
+        # Summary
+        print("\n" + "=" * 60)
+        print("SUMMARY")
+        print("=" * 60)
+        errors = [r for r in results if r.get("error")]
+        successes = [r for r in results if not r.get("error")]
+        print(f"  Total test cases: {len(results)}")
+        print(f"  Successful: {len(successes)}")
+        print(f"  Failed: {len(errors)}")
+        if errors:
+            print("  Failed cases:")
+            for r in errors:
+                print(f"    - {r['query']}: {r['error']}")
+
+    finally:
+        # Step 5: Teardown
+        print("\n--- STEP 5: Teardown ---")
+        try:
+            teardown_mongodb(CASE_ID)
+        except Exception as e:
+            print(f"[TEARDOWN] MongoDB cleanup failed: {e}")
+        try:
+            teardown_qdrant(CASE_ID)
+        except Exception as e:
+            print(f"[TEARDOWN] Qdrant cleanup failed: {e}")
