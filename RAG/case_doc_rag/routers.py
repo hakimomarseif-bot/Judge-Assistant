@@ -89,6 +89,7 @@ def docSelectorDispatchRouter(
                     "sub_answer": "",
                     "sources": [],
                     "found": False,
+                    "sub_answers": [],
                 },
             )
         )
