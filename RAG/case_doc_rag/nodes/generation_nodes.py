@@ -97,10 +97,14 @@ def generateAnswer(state: SubQuestionState) -> Dict[str, Any]:
         idx = doc.metadata.get("chunk_index", "?")
         sources.append(f"{src}:chunk_{idx}")
 
+    # Include actual document text for downstream evaluation (RAGAS etc.)
+    contexts = [doc.page_content for doc in docs] if docs else []
+
     answer_entry = {
         "question": sub_question,
         "answer": answer,
         "sources": sources,
+        "contexts": contexts,
         "found": found,
     }
 

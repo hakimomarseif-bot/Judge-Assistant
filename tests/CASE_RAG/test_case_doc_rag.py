@@ -1899,11 +1899,18 @@ if __name__ == "__main__":
                 sub_answers = output.get("sub_answers", [])
                 error = output.get("error")
 
-                # Gather contexts from sub_answers
+                # Gather actual document text from sub_answers for RAGAS evaluation.
+                # Prefer the 'contexts' field (actual chunk text) over 'sources'
+                # (which only contains file references like "doc.pdf:chunk_0").
                 contexts = []
                 for sa in sub_answers:
-                    sources = sa.get("sources", [])
-                    contexts.extend(sources)
+                    ctx = sa.get("contexts", [])
+                    if ctx:
+                        contexts.extend(ctx)
+                    else:
+                        # Fallback to sources if contexts not available
+                        sources = sa.get("sources", [])
+                        contexts.extend(sources)
                 if not contexts:
                     contexts = ["No context retrieved"]
 
@@ -1950,16 +1957,25 @@ if __name__ == "__main__":
             from datasets import Dataset
             from ragas import evaluate
 
-            # Try modern API first, fall back to legacy wrappers
+            # Use modern ragas API -- avoid deprecated LangchainLLMWrapper
             try:
-                from ragas.llms import LangchainLLMWrapper
+                from ragas.llms import llm_factory as ragas_llm_factory
+            except ImportError:
+                ragas_llm_factory = None
+
+            try:
                 from ragas.embeddings import LangchainEmbeddingsWrapper
             except ImportError:
-                LangchainLLMWrapper = None
                 LangchainEmbeddingsWrapper = None
 
-            # Try modern metric imports first, fall back to legacy
-            from ragas.metrics import AnswerRelevancy, ContextPrecision, ContextRecall, Faithfulness
+            # Use modern metric import path
+            try:
+                from ragas.metrics._answer_relevance import AnswerRelevancy
+                from ragas.metrics._context_precision import ContextPrecision
+                from ragas.metrics._context_recall import ContextRecall
+                from ragas.metrics._faithfulness import Faithfulness
+            except ImportError:
+                from ragas.metrics import AnswerRelevancy, ContextPrecision, ContextRecall, Faithfulness
 
             from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
@@ -1976,7 +1992,7 @@ if __name__ == "__main__":
             }
             dataset = Dataset.from_dict(eval_data)
 
-            # Initialize LLM and embeddings for RAGAS -- use gemini-2.0-flash-lite
+            # Initialize LLM and embeddings for RAGAS -- use gemini-2.5-flash-lite
             llm = ChatGoogleGenerativeAI(
                 model="gemini-2.5-flash-lite",
                 temperature=0.0,
@@ -1985,15 +2001,23 @@ if __name__ == "__main__":
             embeddings = HuggingFaceEmbeddings(
                 model_name=EMBEDDING_MODEL
             )
-            # Wrap for RAGAS if wrappers are available
+
+            # Build evaluation kwargs with modern RAGAS API
             eval_kwargs = {
                 "dataset": dataset,
                 "metrics": [AnswerRelevancy(), ContextPrecision(), ContextRecall(), Faithfulness()],
             }
-            if LangchainLLMWrapper is not None:
-                eval_kwargs["llm"] = LangchainLLMWrapper(llm)
+
+            # Use llm_factory if available (modern API), otherwise fall back to wrapper
+            if ragas_llm_factory is not None:
+                try:
+                    eval_kwargs["llm"] = ragas_llm_factory("gemini-2.5-flash-lite")
+                except Exception:
+                    # If llm_factory fails, fall back to direct LLM
+                    eval_kwargs["llm"] = llm
             else:
                 eval_kwargs["llm"] = llm
+
             if LangchainEmbeddingsWrapper is not None:
                 eval_kwargs["embeddings"] = LangchainEmbeddingsWrapper(embeddings)
             else:

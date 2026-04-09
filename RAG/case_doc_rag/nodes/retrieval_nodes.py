@@ -20,7 +20,7 @@ from RAG.case_doc_rag.state import SubQuestionState
 logger = logging.getLogger("case_doc_rag.retrieval_nodes")
 
 # Module-level constant for score threshold -- easy to tune
-_RETRIEVAL_K = 15
+_RETRIEVAL_K = 25
 
 # Grading system prompt -- tightly coupled to GradeDocument schema, used only here
 _GRADING_SYSTEM_PROMPT = (
@@ -51,6 +51,8 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
 
     if doc_target and doc_mode == "restrict_to_doc":
         # --- restrict_to_doc mode ---
+        # Use similarity search (not MMR) when targeting a specific document
+        # so we get ALL relevant chunks rather than a diverse sample.
 
         # Attempt 1: case_id + metadata.title
         if case_id:
@@ -59,7 +61,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
                 FieldCondition(key="metadata.title", match=MatchValue(value=doc_target)),
             ])
             retriever = vs.as_retriever(
-                search_type="mmr",
+                search_type="similarity",
                 search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter},
             )
             docs = retriever.invoke(sub_question)
@@ -74,7 +76,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
                 FieldCondition(key="metadata.case_id", match=MatchValue(value=case_id)),
             ])
             retriever = vs.as_retriever(
-                search_type="mmr",
+                search_type="similarity",
                 search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter},
             )
             docs = retriever.invoke(sub_question)
@@ -89,7 +91,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
                 FieldCondition(key="metadata.type", match=MatchValue(value=doc_target)),
             ])
             retriever = vs.as_retriever(
-                search_type="mmr",
+                search_type="similarity",
                 search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter},
             )
             docs = retriever.invoke(sub_question)
@@ -110,6 +112,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
 
     else:
         # --- no_doc_specified mode ---
+        # Keep MMR but use a larger fetch_k candidate pool for better diversity selection.
 
         # Attempt 1: case_id filter
         if case_id:
@@ -118,7 +121,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
             ])
             retriever = vs.as_retriever(
                 search_type="mmr",
-                search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter},
+                search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter, "fetch_k": 40},
             )
             docs = retriever.invoke(sub_question)
             logger.debug(
@@ -181,6 +184,16 @@ def retrievalGrader(state: SubQuestionState) -> Dict[str, Any]:
             doc = future_to_doc[future]
             if future.result():
                 relevant_docs.append(doc)
+
+    # Fallback: if the grader rejected everything, keep the top 3 original docs.
+    # The generation LLM can handle marginally relevant context better than
+    # returning nothing at all.
+    if len(relevant_docs) == 0 and len(docs) > 0:
+        relevant_docs = docs[:3]
+        logger.warning(
+            "[%s] retrievalGrader: grader rejected all docs, falling back to top %d",
+            request_id, len(relevant_docs),
+        )
 
     logger.info(
         "[%s] retrievalGrader: %d/%d docs passed grading",
