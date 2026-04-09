@@ -20,7 +20,7 @@ from RAG.case_doc_rag.state import SubQuestionState
 logger = logging.getLogger("case_doc_rag.retrieval_nodes")
 
 # Module-level constant for score threshold -- easy to tune
-_SCORE_THRESHOLD = 0.45
+_RETRIEVAL_K = 15
 
 # Grading system prompt -- tightly coupled to GradeDocument schema, used only here
 _GRADING_SYSTEM_PROMPT = (
@@ -60,7 +60,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
             ])
             retriever = vs.as_retriever(
                 search_type="mmr",
-                search_kwargs={"k": 8, "filter": meta_filter, "score_threshold": _SCORE_THRESHOLD},
+                search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter},
             )
             docs = retriever.invoke(sub_question)
             logger.debug(
@@ -75,7 +75,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
             ])
             retriever = vs.as_retriever(
                 search_type="mmr",
-                search_kwargs={"k": 8, "filter": meta_filter, "score_threshold": _SCORE_THRESHOLD},
+                search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter},
             )
             docs = retriever.invoke(sub_question)
             logger.debug(
@@ -90,7 +90,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
             ])
             retriever = vs.as_retriever(
                 search_type="mmr",
-                search_kwargs={"k": 8, "filter": meta_filter, "score_threshold": _SCORE_THRESHOLD},
+                search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter},
             )
             docs = retriever.invoke(sub_question)
             if docs:
@@ -101,7 +101,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
 
         # Attempt 4: unfiltered last resort
         if not docs:
-            docs = get_retriever({"k": 8, "score_threshold": _SCORE_THRESHOLD}).invoke(sub_question)
+            docs = get_retriever({"k": _RETRIEVAL_K}).invoke(sub_question)
             if docs:
                 logger.warning(
                     "[%s] retrieve attempt4 (unfiltered): %d docs",
@@ -118,7 +118,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
             ])
             retriever = vs.as_retriever(
                 search_type="mmr",
-                search_kwargs={"k": 8, "filter": meta_filter, "score_threshold": _SCORE_THRESHOLD},
+                search_kwargs={"k": _RETRIEVAL_K, "filter": meta_filter},
             )
             docs = retriever.invoke(sub_question)
             logger.debug(
@@ -127,7 +127,7 @@ def retrieve(state: SubQuestionState) -> Dict[str, Any]:
 
         # Attempt 2: unfiltered fallback
         if not docs:
-            docs = get_retriever({"k": 8, "score_threshold": _SCORE_THRESHOLD}).invoke(sub_question)
+            docs = get_retriever({"k": _RETRIEVAL_K}).invoke(sub_question)
             logger.warning(
                 "[%s] retrieve (unfiltered fallback): %d docs",
                 request_id, len(docs),

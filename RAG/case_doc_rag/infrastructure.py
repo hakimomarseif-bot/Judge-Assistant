@@ -132,7 +132,7 @@ def get_retriever(search_kwargs: Optional[dict] = None):
     would return a retriever with wrong parameters. Used only for
     unfiltered fallback in retrieval_nodes.
     """
-    kwargs = search_kwargs or {"k": 8}
+    kwargs = search_kwargs or {"k": 15}
     return get_vectorstore().as_retriever(
         search_type="mmr", search_kwargs=kwargs
     )
